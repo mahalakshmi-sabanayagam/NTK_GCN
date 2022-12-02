@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from layers import GraphConvolution
 
 class GCN_deep(nn.Module):
-    def __init__(self, nfeat, nhid, nclass, layers=1, linear=False, sigma=1):
+    def __init__(self, nfeat, nhid, nclass, layers=1, linear=True, sigma=1):
         super(GCN_deep, self).__init__()
 
         '''
@@ -38,7 +38,7 @@ class GCN_deep(nn.Module):
 
         k = (torch.sqrt(torch.tensor(self.sigma).type(torch.float)) / (torch.sqrt(torch.tensor(self.gc2.in_features).type(torch.float))))
         x = k * self.gc2(x, adj)
-        return F.softmax(x, dim=1)  # F.log_softmax(x, dim=1)
+        return x
 
 class GCN_skip(nn.Module):
     def __init__(self, nfeat, nhid, nclass, layers=1, linear=False, seed=42, skip_formulation='gcn', alpha=0.2, sigma=1, relu_h0=False):
@@ -105,6 +105,6 @@ class GCN_skip(nn.Module):
             x = k * self.gc2(x+h0, adj)
         else:
             x = k * self.gc2(x, adj)
-        return F.softmax(x, dim=1)  # F.log_softmax(x, dim=1)
+        return x
 
 

@@ -15,7 +15,67 @@ def encode_onehot(labels):
     return labels_onehot
 
 
-def load_data(dataset="WebKB", self_loop=1, feature_normalisation=1):
+def load_data(dataset="cora", self_loop=1, feature_normalisation=1, adj_norm='row_norm', order_by_cls=False):
+
+    if dataset == "dc_sbm":
+        # adj sampled from sbm, features = I
+        n = 1000
+        q = 0.1
+        p = 0.8
+        print('prob ', p, q)
+
+        np.random.seed(10)
+        deg_cor = np.random.uniform(0,1,n)
+        deg_cor = torch.tensor(deg_cor)
+        deg_cor[:int(n/2)] = deg_cor[:int(n/2)]/(2*torch.sum(deg_cor[:int(n/2)]))
+        deg_cor[int(n / 2):] = deg_cor[int(n / 2):] / (2 * torch.sum(deg_cor[int(n / 2):]))
+        deg_cor_mat = deg_cor.reshape(-1,1) @ deg_cor.reshape(1,-1)
+
+        sbm = q * torch.ones((n, n), dtype=torch.float64)
+        sbm[:int(n / 2), :int(n / 2)] = p
+        sbm[int(n / 2):, int(n / 2):] = p
+
+        dc_sbm = deg_cor_mat * sbm
+
+        sample = True
+        if sample == False:
+            adj = dc_sbm
+        else:
+            adj = torch.distributions.binomial.Binomial(1, sbm).sample()
+            adj = torch.triu(adj, diagonal=1)
+            adj = adj + adj.t()
+        y = np.zeros((n,2), dtype=np.int64)
+        y[:int(n / 2), 0] = 1
+        y[int(n / 2):, 1] = 1
+        labels = torch.LongTensor(y)
+        features = torch.FloatTensor(torch.eye(n))
+        adj = sp.coo_matrix(adj)
+
+        if adj_norm == 'sym_norm':  ## D^-0.5 adj D^-0.5
+            adj = normalize_adj_symmertric(adj, self_loop=self_loop)
+        elif adj_norm == 'row_norm':  ## D^-1 adj
+            if self_loop:
+                adj = normalize(adj + sp.eye(adj.shape[0]))
+            else:
+                adj = normalize(adj)
+        elif adj_norm == 'col_norm':  ## adj D^-1
+            if self_loop:
+                adj = normalize(adj + sp.eye(adj.shape[0]), False)
+            else:
+                adj = normalize(adj, False)
+        elif adj_norm == 'unnorm':  ## adj
+            if self_loop:
+                adj = adj + sp.eye(adj.shape[0])
+        adj = sparse_mx_to_torch_sparse_tensor(adj)
+
+        idx_train = range(int(0.7 * n))
+        idx_val = range(int(0.8 * n), n)
+        idx_test = range(int(0.7 * n), n)
+        idx_train = torch.LongTensor(idx_train)
+        idx_val = torch.LongTensor(idx_val)
+        idx_test = torch.LongTensor(idx_test)
+        return adj, features, labels, idx_train, idx_val, idx_test
+
     """Load citation network dataset (cora only for now)"""
     print('Loading {} dataset...'.format(dataset))
 
@@ -24,53 +84,17 @@ def load_data(dataset="WebKB", self_loop=1, feature_normalisation=1):
     idx_features_labels = np.genfromtxt("{}{}.content".format(path, dataset),
                                         dtype=np.dtype(str))
 
-    # combine classes to get binary cls dataset
-    l = idx_features_labels[:,-1]
-    if dataset == "cora":
-        nn = np.where(l == 'Neural_Networks')[0]
-        rein_l = np.where(l == 'Reinforcement_Learning')[0]
-        ga = np.where(l == 'Genetic_Algorithms')[0]
-        cb = np.where(l == 'Case_Based')[0]
-        pm = np.where(l == 'Probabilistic_Methods')[0]
-        rl = np.where(l == 'Rule_Learning')[0]
-        th = np.where(l == 'Theory')[0]
-        cls1 = np.concatenate((nn,th,pm), axis=0)
-        cls2 = np.concatenate((cb,rl,rein_l,ga), axis=0)
-        idx_features_labels[cls2,-1] = 'cls_2'
-        idx_features_labels[cls1, -1] = 'cls_1'
-        all_chosen_idx = np.concatenate((cb,pm,rl,th,nn,rein_l,ga), axis=0)
-    elif dataset == "WebKB":
-        course = np.where(l == 'course')[0]
-        project = np.where(l == 'project')[0]
-        student = np.where(l == 'student')[0]
-        faculty = np.where(l == 'faculty')[0]
-        staff = np.where(l == 'staff')[0]
-        cls2 = np.concatenate((course, project,faculty, staff), axis=0)
-        idx_features_labels[cls2, -1] = 'cls_2'
-        all_chosen_idx = np.concatenate((student, course, project, faculty, staff), axis=0)
-    elif dataset == "citeseer":
-        ai = np.where(l == 'AI')[0]
-        ml = np.where(l == 'ML')[0]
-        db = np.where(l == 'DB')[0]
-        ir = np.where(l == 'IR')[0]
-        hci = np.where(l == 'HCI')[0]
-        agents = np.where(l == 'Agents')[0]
-        cls1 = np.concatenate((ai,ml,agents), axis=0)
-        idx_features_labels[cls1, -1] = 'cls_1'
-        cls2 = np.concatenate((db, ir,hci), axis=0)
-        idx_features_labels[cls2, -1] = 'cls_2'
-        all_chosen_idx = np.concatenate((ai, ml, db, ir, hci, agents), axis=0)
-
-    idx_features_labels = idx_features_labels[all_chosen_idx]
     np.random.seed(25)
-    indices = np.random.permutation(idx_features_labels.shape[0])
+    if order_by_cls:
+        indices = np.argsort(idx_features_labels[:, -1])
+    else:
+        indices = np.random.permutation(idx_features_labels.shape[0])
     idx_features_labels = idx_features_labels[indices]
-    print("Total instances for binary cls ", idx_features_labels.shape)
+    print(np.unique(idx_features_labels[:, -1], return_counts=True))
+    print("Total instances ", idx_features_labels.shape)
 
     features = sp.csr_matrix(idx_features_labels[:, 1:-1], dtype=np.float32)
-    # dont call onehot as it sometimes create [0,1] and sometimes [1,0] -- leading to non reproducible results.
-    # so, assign 0 for cls_2, 1 for cls_1
-    labels = np.array([0 if i == 'cls_2' else 1 for i in idx_features_labels[:,-1]])
+    labels = encode_onehot(idx_features_labels[:, -1])
     print("Labels shape ", labels.shape)
 
     # build graph
@@ -100,15 +124,29 @@ def load_data(dataset="WebKB", self_loop=1, feature_normalisation=1):
     # build symmetric adjacency matrix
     adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
 
-    adj = normalize_adj_symmertric(adj, self_loop=self_loop)
-    #adj = normalize(adj + sp.eye(adj.shape[0]))
+    if adj_norm == 'sym_norm':  ## D^-0.5 adj D^-0.5
+        adj = normalize_adj_symmertric(adj, self_loop=self_loop)
+    elif adj_norm == 'row_norm':  ## D^-1 adj
+        if self_loop:
+            adj = normalize(adj + sp.eye(adj.shape[0]))
+        else:
+            adj = normalize(adj)
+    elif adj_norm == 'col_norm': ## adj D^-1
+        if self_loop:
+            adj = normalize(adj + sp.eye(adj.shape[0]), False)
+        else:
+            adj = normalize(adj, False)
+    elif adj_norm == 'unnorm':  ## adj
+        if self_loop:
+            adj = adj + sp.eye(adj.shape[0])
+
     if feature_normalisation == 1:
        features = normalize(features)
 
     if dataset == "cora":
-        idx_train = range(708)
-        idx_val = range(500, 708)
-        idx_test = range(708, 2708)
+        idx_train = range(1000)
+        idx_val = range(1000, 1208)
+        idx_test = range(1208, 2708)
     elif dataset == "WebKB":
         idx_train = range(377)
         idx_val = range(350, 377)
@@ -129,13 +167,17 @@ def load_data(dataset="WebKB", self_loop=1, feature_normalisation=1):
     return adj, features, labels, idx_train, idx_val, idx_test
 
 
-def normalize(mx):  # D^-1 mx
+
+def normalize(mx, row_norm=True):  # D^-1 mx or mx D^-1
     """Row-normalize sparse matrix"""
     rowsum = np.array(mx.sum(1))
     r_inv = np.power(rowsum, -1).flatten()  # D^-1
     r_inv[np.isinf(r_inv)] = 0.
     r_mat_inv = sp.diags(r_inv)
-    mx = r_mat_inv.dot(mx)  # D^-1 mx
+    if row_norm:
+        mx = r_mat_inv.dot(mx)  # D^-1 mx
+    else:
+        mx = mx.dot(r_mat_inv)  # mx D^-1
     return mx
 
 
@@ -154,7 +196,8 @@ def normalize_adj_symmertric(mx, self_loop=1):  # D^-0.5 A D^-0.5
 
 def accuracy(output, labels):
     preds = output.max(1)[1].type_as(labels)
-    correct = preds.eq(labels).double()
+    true_labels = labels.max(1)[1].type_as(labels)
+    correct = preds.eq(true_labels).double()
     correct = correct.sum()
     return correct / len(labels)
 

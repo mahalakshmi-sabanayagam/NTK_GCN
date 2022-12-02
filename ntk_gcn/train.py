@@ -19,15 +19,13 @@ parser.add_argument('--no-cuda', action='store_true', default=False,
 parser.add_argument('--fastmode', action='store_true', default=False,
                     help='Validate during training pass.')
 parser.add_argument('--seed', type=int, default=42, help='Random seed.')
-parser.add_argument('--epochs', type=int, default=2000,
+parser.add_argument('--epochs', type=int, default=1000,
                     help='Number of epochs to train.')
 parser.add_argument('--lr', type=float, default=0.01,
                     help='Initial learning rate.')
 parser.add_argument('--hidden', type=int, default=16,
                     help='Number of hidden units.')
-parser.add_argument('--loss', type=str, default='nll',
-                    help='mention the loss to optimize')
-parser.add_argument('--self_loop', type=int, default=1,
+parser.add_argument('--self_loop', type=int, default=0,
                     help='1 for adding self loop, 0 for no self loop')
 parser.add_argument('--feature_norm', type=int, default=1,
                     help='1 for adding featue normalisation, 0 for no feature normalisation')
@@ -37,7 +35,7 @@ parser.add_argument('--layers', type=int, default=1,
                     help='number of layers')
 parser.add_argument('--gcn_linear', type=int, default=1,
                     help='pass 0 to use relu non linearity')
-parser.add_argument('--csigma', type=int, default=2,
+parser.add_argument('--csigma', type=int, default=1,
                     help='relevant only for relu gcn, pass 1 for trying out relu')
 parser.add_argument('--gcn_skip', type=int, default=0,
                     help='pass 1 for skip connection gcn')
@@ -45,13 +43,20 @@ parser.add_argument('--skip_seed', type=int, default=42,
                     help='pass the seed for weight init in skip')
 parser.add_argument('--skip_form', type=str, default='gcn',
                     help='pass gcnii for skip-alpha')
-parser.add_argument('--skip_alpha', type=float, default=0.2,
+parser.add_argument('--skip_alpha', type=float, default=0.1,
                     help='alpha for gcnii skip formulation')
 parser.add_argument('--train_gcn', type=int, default=0,
                     help='pass 1 for training gcn')
 parser.add_argument('--relu_h0', type=int, default=0,
                     help='pass 1 for applying relu to H_0')
-
+parser.add_argument('--adj_norm', type=str, default='row_norm',
+                    help='pass sym_norm, row_norm, col_norm, unnorm for adj normalisation')
+parser.add_argument('--feature_identity', type=int, default=0,
+                    help='pass 0 for using features')
+parser.add_argument('--order_by_cls', type=int, default=0,
+                    help='pass 1 to order the kernel by class')
+parser.add_argument('--save_kernel', type=int, default=0,
+                    help='pass 1 to save the NTK')
 
 args = parser.parse_args()
 args.cuda = not args.no_cuda and torch.cuda.is_available()
@@ -64,10 +69,13 @@ if args.cuda:
     device = torch.device('cuda:0')
 
 # Load data
-if args.dataset == 'cora' or args.dataset == 'WebKB' or args.dataset == 'citeseer':
-    adj, features, labels, idx_train, idx_val, idx_test = load_data(dataset=args.dataset, self_loop=args.self_loop, feature_normalisation=args.feature_norm)
+if args.dataset == 'cora' or args.dataset == 'dc_sbm' or args.dataset == 'citeseer':
+    adj, features, labels, idx_train, idx_val, idx_test = load_data(dataset=args.dataset, self_loop=args.self_loop,
+                                                                    feature_normalisation=args.feature_norm,
+                                                                    adj_norm=args.adj_norm,
+                                                                    order_by_cls=args.order_by_cls)
 else:
-    print('exiting! pass cora, citeseer or WebKB')
+    print('exiting! pass cora, citeseer or dc_sbm')
     exit()
 print('number of train, val, test ', len(idx_train), len(idx_val), len(idx_test))
 print('shape of adj, features, labels ', adj.shape, features.shape, labels.shape)
@@ -77,7 +85,7 @@ if args.gcn_skip == False:
     print('Vanilla GCN ...')
     model = GCN_deep(nfeat=features.shape[1],
                      nhid=args.hidden,
-                     nclass=labels.max().item() + 1,
+                     nclass=labels.shape[1],
                      layers=args.layers,
                      linear=args.gcn_linear,
                      sigma=args.csigma)
@@ -85,7 +93,7 @@ else:
     print('GCN with skip ...')
     model = GCN_skip(nfeat=features.shape[1],
                      nhid=args.hidden,
-                     nclass=labels.max().item() + 1,
+                     nclass=labels.shape[1],
                      layers=args.layers,
                      linear=args.gcn_linear,
                      seed=args.skip_seed,
@@ -113,59 +121,38 @@ def train(epoch):
     model.train()
     optimizer.zero_grad()
     output = model(features, adj)
-    # default loss
-    loss = None
-    labels_one_hot = None
-    if args.loss == 'nll': #according to our setting
-        loss_train = F.nll_loss(output[idx_train], labels[idx_train])
-    elif args.loss == 'mse':
-        loss = torch.nn.MSELoss(reduction="sum")
-        labels_one_hot = torch.nn.functional.one_hot(labels).type(torch.float32)
-        loss_train = loss(output[idx_train], labels_one_hot[idx_train])
+    loss = torch.nn.MSELoss(reduction="sum")
+    loss_train = loss(output[idx_train], labels[idx_train].type(torch.float32))
     acc_train = accuracy(output[idx_train], labels[idx_train])
     loss_train.backward()
     optimizer.step()
 
-    val = False
-    if val:
-        if not args.fastmode:
-            # Evaluate validation set performance separately,
-            # deactivates dropout during validation run.
-            model.eval()
-            output = model(features, adj)
+    if not args.fastmode:
+        # Evaluate validation set performance separately,
+        # deactivates dropout during validation run.
+        model.eval()
+        output = model(features, adj)
 
-        if args.loss == 'nll':
-            loss_val = F.nll_loss(output[idx_val], labels[idx_val])
-        elif args.loss == 'mse':
-            loss_val = loss(output[idx_val], labels_one_hot[idx_val])
-        acc_val = accuracy(output[idx_val], labels[idx_val])
+    loss_val = loss(output[idx_val], labels[idx_val].type(torch.float32))
+    acc_val = accuracy(output[idx_val], labels[idx_val])
+    if (epoch + 1) % 500 == 0:
         print('Epoch: {:04d}'.format(epoch+1),
               'loss_train: {:.4f}'.format(loss_train.item()),
               'acc_train: {:.4f}'.format(acc_train.item()),
               'loss_val: {:.4f}'.format(loss_val.item()),
               'acc_val: {:.4f}'.format(acc_val.item()),
               'time: {:.4f}s'.format(time.time() - t))
-    else:
-        if (epoch+1)  % 500 == 0:
-            print('Epoch: {:04d}'.format(epoch + 1),
-                  'loss_train: {:.4f}'.format(loss_train.item()),
-                  'acc_train: {:.4f}'.format(acc_train.item()),
-                  'time: {:.4f}s'.format(time.time() - t))
+    return acc_val
 
 def test():
     model.eval()
     output = model(features, adj)
-    loss_test = None
-    if args.loss == 'nll':
-        loss_test = F.nll_loss(output[idx_val], labels[idx_val])
-    elif args.loss == 'mse':
-        loss = torch.nn.MSELoss(reduction="sum")
-        labels_one_hot = torch.nn.functional.one_hot(labels)
-        loss_test = loss(output[idx_test], labels_one_hot[idx_test])
+    loss = torch.nn.MSELoss(reduction="sum")
+    loss_test = loss(output[idx_test], labels[idx_test].type(torch.float32))
     acc_test = accuracy(output[idx_test], labels[idx_test])
     print("Test set results:",
           "lr= {:.4f}".format(args.lr),
-          "depth= {:.4f}".format(args.hidden),
+          "depth= {:.4f}".format(args.layers),
           "loss= {:.4f}".format(loss_test.item()),
           "accuracy= {:.4f}".format(acc_test.item()))
     return acc_test.item()
@@ -189,25 +176,33 @@ if train_gcn:
     # Train model
     t_total = time.time()
     acc_test = []
+    best_val_acc = 0
+    final_test_acc = 0
     for epoch in range(args.epochs):
-        train(epoch)
+        acc_val = train(epoch)
 
-        if (epoch+1) % 1000==0:
+        if acc_val > best_val_acc:
+            best_val_acc = acc_val
+
+        if (epoch+1) % 500==0:
             acc = test()
+            if best_val_acc == acc_val:
+                final_test_acc = acc
             acc_test.append(acc)
 
     print('TEST ACCURACIES ', acc_test)
+    print('Final test accuracy ', final_test_acc)
 else:
     print("--------- NTK for GCN ----------")
-    # change label to +1, -1 --> change 0 to -1
-    labels[labels==0] = -1
     # store ground truth
     ground_truth = labels[idx_test]
-    # change labels in test set to 0 for fair prediction
-    labels[idx_test] = 0
     dtype= torch.float64
 
-    depth_eval = [1,2] #,4,8,16,32,64,128]
+    filter = str(args.dataset) + '_' + str(args.adj_norm) + '_xxt' + str(args.feature_identity) + '_'
+    if args.gcn_skip:
+        filter = filter + 'skip_' + str(args.skip_form) + '_'
+
+    depth_eval = [1,2,4,8,16]
     for d in depth_eval:
         print('Evaluating kernel for depth ', d)
         a = adj.to_dense()
@@ -252,8 +247,10 @@ else:
                 kernel += sig * t
                 sig = (a @ sig @ a.t()) *csigma
                 if args.gcn_skip:
-                    #sig = sig + sig_1
-                    sig = (1-alpha)**2 * sig + alpha**2 * sig_1
+                    if args.skip_form == "gcn":
+                        sig = sig + sig_1
+                    else:
+                        sig = (1-alpha)**2 * sig + alpha**2 * sig_1
         else:
             print('Relu GCN....')
             # compute sigma_n + sigma_(n-1) * SS^T * der_relu_(n-1) + ... + sigma_1 * SS^T (n-1 times) * der_relu(n-1) * ... der_relu(1)
@@ -284,22 +281,6 @@ else:
 
         kernel += sig
 
-        # compute derivative of sigmoid layer
-        one_n = torch.ones((a.shape), dtype=dtype).to(device)
-        p = torch.zeros((a.shape), dtype=dtype).to(device)
-        diag_sig = torch.diagonal(sig)
-        sig_i = p+diag_sig.reshape(1,-1)
-        sig_j = p+diag_sig.reshape(-1,1)
-        p = sig_i+sig_j
-        q = sig_i*sig_j
-        r = 2*sig**2
-        der_new = 0.25*(one_n - 0.25*p + 0.0625*(q+r) + 0.125*(sig_i*sig_i + sig_j*sig_j))
-
-        # compute final kernel
-        kernel = kernel * der_new
-        if args.gcn_linear == True:
-            kernel *= csigma**(d-1)
-
         # compute f(x)
         id_t = idx_test[0]
         id_train = idx_train[-1]+1
@@ -310,10 +291,11 @@ else:
 
         output = kernel_test @ kernel_inv.type(torch.float64) @ labels_train.type(torch.float64)
 
+        file = filter + str(d) + '.npy'
+        if args.save_kernel:
+            np.save(file, kernel)
+            print('!!!Kernel of depth ', d , ' saved to file ', file)
+
         # compute accuracy of the prediction
-        pred = output
-        pred[pred >= 0] = 1
-        pred[pred < 0] = -1
-        pred = pred.type_as(ground_truth)
-        acc = pred.eq(ground_truth).double().sum() / len(ground_truth)
+        acc = accuracy(output, ground_truth)
         print('Test accuracy using NTK ', acc)
