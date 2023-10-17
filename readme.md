@@ -1,6 +1,6 @@
 The code is adopted and changed according to our needs from https://github.com/tkipf/pygcn 
 
-This github provides the implementation to reproduce the results in paper `Representation Power of Graph Convolutions : Neural Tangent Kernel Analysis' ([arxiv](https://arxiv.org/abs/2210.09809)).
+This github provides the implementation to reproduce the results in paper `Analysis of Convolutions, Non-linearity and Depth in Graph Neural Networks using Neural Tangent Kernel' ([arxiv](https://arxiv.org/abs/2210.09809)).
 
 * Install the required packages
 `pip install -r requirement.txt`
