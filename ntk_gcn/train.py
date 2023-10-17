@@ -11,6 +11,7 @@ import torch.optim as optim
 
 from utils import load_data, accuracy
 from models import GCN_deep, GCN_skip
+from sklearn.kernel_ridge import KernelRidge
 
 # Training settings
 parser = argparse.ArgumentParser()
@@ -287,9 +288,10 @@ else:
         kernel_train = kernel[:id_train,:id_train]
         labels_train = labels[:id_train].type(torch.double)
         kernel_test = kernel[id_t:, :id_train]
-        kernel_inv = torch.pinverse(kernel_train, rcond=1e-8)
 
-        output = kernel_test @ kernel_inv.type(torch.float64) @ labels_train.type(torch.float64)
+        krr = KernelRidge(alpha=0.0)
+        krr.fit(kernel_train,labels_train)
+        output = torch.tensor(krr.predict(kernel_test))
 
         file = filter + str(d) + '.npy'
         if args.save_kernel:
