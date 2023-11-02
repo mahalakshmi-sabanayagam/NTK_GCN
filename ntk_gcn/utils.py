@@ -3,6 +3,7 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 import sys
+from sklearn.kernel_ridge import KernelRidge
 
 sys.setrecursionlimit(99999)
 
@@ -14,42 +15,45 @@ def encode_onehot(labels):
                              dtype=np.int32)
     return labels_onehot
 
+def dc_sbm(n=1000, p=0.8, q=0.1, r=-1, sample=True):
+    # adj sampled from sbm, features = I
+    if r != -1:
+        q = ((1 - r) * p) / (1 + r)
+    print('prob ', p, q)
+
+    np.random.seed(10)
+    deg_cor = np.random.uniform(0.1, 1, n)
+    deg_cor = torch.tensor(deg_cor)
+    pi_sum = int(n) / 2  # int(n)/2
+    deg_cor[:int(n / 2)] = (pi_sum * deg_cor[:int(n / 2)]) / (2 * torch.sum(deg_cor[:int(n / 2)]))
+    deg_cor[int(n / 2):] = (pi_sum * deg_cor[int(n / 2):]) / (2 * torch.sum(deg_cor[int(n / 2):]))
+    deg_cor_mat = deg_cor.reshape(-1, 1) @ deg_cor.reshape(1, -1)
+
+    sbm = q * torch.ones((n, n), dtype=torch.float64)
+    sbm[:int(n / 2), :int(n / 2)] = p
+    sbm[int(n / 2):, int(n / 2):] = p
+
+    dc_sbm = deg_cor_mat * sbm
+
+    if sample == False:
+        adj = dc_sbm
+    else:
+        adj = torch.distributions.binomial.Binomial(1, dc_sbm).sample()
+        adj = torch.triu(adj, diagonal=1)
+        adj = adj + adj.t()
+    y = np.zeros((n, 2), dtype=np.int64)
+    y[:int(n / 2), 0] = 1
+    y[int(n / 2):, 1] = 1
+    labels = torch.LongTensor(y)
+    features = torch.FloatTensor(torch.eye(n))
+    adj = sp.coo_matrix(adj)
+    return adj, features, labels
 
 def load_data(dataset="cora", self_loop=1, feature_normalisation=1, adj_norm='row_norm', order_by_cls=False):
 
     if dataset == "dc_sbm":
-        # adj sampled from sbm, features = I
         n = 1000
-        q = 0.1
-        p = 0.8
-        print('prob ', p, q)
-
-        np.random.seed(10)
-        deg_cor = np.random.uniform(0,1,n)
-        deg_cor = torch.tensor(deg_cor)
-        deg_cor[:int(n/2)] = deg_cor[:int(n/2)]/(2*torch.sum(deg_cor[:int(n/2)]))
-        deg_cor[int(n / 2):] = deg_cor[int(n / 2):] / (2 * torch.sum(deg_cor[int(n / 2):]))
-        deg_cor_mat = deg_cor.reshape(-1,1) @ deg_cor.reshape(1,-1)
-
-        sbm = q * torch.ones((n, n), dtype=torch.float64)
-        sbm[:int(n / 2), :int(n / 2)] = p
-        sbm[int(n / 2):, int(n / 2):] = p
-
-        dc_sbm = deg_cor_mat * sbm
-
-        sample = True
-        if sample == False:
-            adj = dc_sbm
-        else:
-            adj = torch.distributions.binomial.Binomial(1, sbm).sample()
-            adj = torch.triu(adj, diagonal=1)
-            adj = adj + adj.t()
-        y = np.zeros((n,2), dtype=np.int64)
-        y[:int(n / 2), 0] = 1
-        y[int(n / 2):, 1] = 1
-        labels = torch.LongTensor(y)
-        features = torch.FloatTensor(torch.eye(n))
-        adj = sp.coo_matrix(adj)
+        adj, features, labels = dc_sbm(n=n, p=0.8, q=0.2, r=-1, sample=True)
 
         if adj_norm == 'sym_norm':  ## D^-0.5 adj D^-0.5
             adj = normalize_adj_symmertric(adj, self_loop=self_loop)
@@ -104,10 +108,10 @@ def load_data(dataset="cora", self_loop=1, feature_normalisation=1, adj_norm='ro
         edges_unordered = np.genfromtxt("{}{}.cites".format(path, dataset),
                                         dtype=np.int32)
     elif dataset == "WebKB" or dataset == "citeseer":
-        idx = np.array(idx_features_labels[:, 0], dtype=np.str)
+        idx = np.array(idx_features_labels[:, 0], dtype=str)
         idx_map = {j: i for i, j in enumerate(idx)}
         edges_unordered = np.genfromtxt("{}{}.cites".format(path, dataset),
-                                        dtype=np.str)
+                                        dtype=str)
 
     # pick only the edges with chosen nodes
     s = [edges_unordered[i] for i in range(edges_unordered.shape[0]) if
@@ -201,6 +205,11 @@ def accuracy(output, labels):
     correct = correct.sum()
     return correct / len(labels)
 
+def kernel_ridge_reg(kernel_train, kernel_test, labels_train, alpha=0):
+    krr = KernelRidge(alpha=alpha, kernel='precomputed')
+    krr.fit(kernel_train, labels_train)
+    output = torch.tensor(krr.predict(kernel_test))
+    return output
 
 def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     """Convert a scipy sparse matrix to a torch sparse tensor."""

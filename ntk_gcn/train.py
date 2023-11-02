@@ -9,9 +9,8 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
-from utils import load_data, accuracy
+from utils import load_data, accuracy, kernel_ridge_reg
 from models import GCN_deep, GCN_skip
-from sklearn.kernel_ridge import KernelRidge
 
 # Training settings
 parser = argparse.ArgumentParser()
@@ -34,7 +33,7 @@ parser.add_argument('--dataset', type=str, default='cora',
                     help='pass citeseer, WebKB')
 parser.add_argument('--layers', type=int, default=1,
                     help='number of layers')
-parser.add_argument('--gcn_linear', type=int, default=1,
+parser.add_argument('--gcn_linear', type=int, default=0,
                     help='pass 0 to use relu non linearity')
 parser.add_argument('--csigma', type=int, default=1,
                     help='relevant only for relu gcn, pass 1 for trying out relu')
@@ -195,23 +194,40 @@ if train_gcn:
     print('Final test accuracy ', final_test_acc)
 else:
     print("--------- NTK for GCN ----------")
+
+    if args.save_kernel:
+        file_path = f"../{args.dataset}/"
+        isExist = os.path.exists(file_path)
+        if not isExist:
+            # Create a new directory because it does not exist
+            os.makedirs(file_path)
+
     # store ground truth
     ground_truth = labels[idx_test]
     dtype= torch.float64
 
-    filter = str(args.dataset) + '_' + str(args.adj_norm) + '_xxt' + str(args.feature_identity) + '_'
+    filter = str(args.dataset) + '_' + str(args.adj_norm) + '_lin' + str(args.gcn_linear) + '_xxt' + str(args.feature_identity) + '_loop' + str(args.self_loop) + '_'
     if args.gcn_skip:
         filter = filter + 'skip_' + str(args.skip_form) + '_'
+        if args.skip_form != "gcn":
+            filter += 'alpha' + str(args.skip_alpha) + '_'
 
     depth_eval = [1,2,4,8,16]
     for d in depth_eval:
         print('Evaluating kernel for depth ', d)
         a = adj.to_dense()
-        x = features @ features.t()
-        a_norm = torch.norm(a)
+        if args.adj_norm == 'unnorm':
+            a = a/a.shape[0]
+        if args.feature_identity:
+            x = torch.eye(adj.shape[0], dtype=dtype).to(device)
+            x = x.float()
+        else:
+            x = features @ features.t()
         csigma = 1 #to avoid precision errors and it is not relevant for ntk as discussed in the paper
 
-        sig = (a @ x @ a.t())
+        kernel = torch.zeros((a.shape), dtype=dtype).to(device)
+        depth = d
+        sig = a @ x @ a.t()
         non_linear_h0 = args.relu_h0
         if args.gcn_skip:
             if args.skip_form != "gcn":
@@ -230,57 +246,50 @@ else:
                 sig_1 = sig
             else:
                 if non_linear_h0:
-                    sig = ((1-alpha)**2*sig +  (1-alpha)*alpha*(E @ a.t() + a @ E )  + alpha**2 * E)*csigma
+                    sig = ((1 - alpha) ** 2 * sig + (1 - alpha) * alpha * (
+                                E @ a.t() + a @ E) + alpha ** 2 * E) * csigma
                     sig_1 = E
                 else:
-                    sig = ((1-alpha)**2*sig +  (1-alpha)*alpha*(x @ a.t() + a @ x )  + alpha**2 * x)*csigma
+                    sig = ((1 - alpha) ** 2 * sig + (1 - alpha) * alpha * (
+                                x @ a.t() + a @ x) + alpha ** 2 * x) * csigma
                     sig_1 = x
-        kernel = torch.zeros((a.shape), dtype=dtype).to(device)
-        depth = d
 
-        if args.gcn_linear == True:
-            print('linear GCN....')
-            # compute sigma_n + sigma_(n-1) * SS^T + ... + sigma_1 * SS^T (n-1 times)
-            for i in range(depth,0,-1):
-                t = torch.ones((a.shape), dtype=dtype).to(device)
-                for j in range(i):
-                    t = (t* (a @ a.t())) * csigma
-                kernel += sig * t
-                sig = (a @ sig @ a.t()) *csigma
-                if args.gcn_skip:
-                    if args.skip_form == "gcn":
-                        sig = sig + sig_1
-                    else:
-                        sig = (1-alpha)**2 * sig + alpha**2 * sig_1
-        else:
-            print('Relu GCN....')
-            # compute sigma_n + sigma_(n-1) * SS^T * der_relu_(n-1) + ... + sigma_1 * SS^T (n-1 times) * der_relu(n-1) * ... der_relu(1)
-            kernel_sub = torch.zeros((depth, a.shape[0], a.shape[1]), dtype=dtype).to(device)
-            for i in range(depth):
+        kernel_sub = torch.zeros((depth, a.shape[0], a.shape[1]), dtype=dtype).to(device)
+        for i in range(depth):
+            if args.gcn_linear:
+                E = sig
+                E_der = torch.ones((a.shape[0]), dtype=dtype).to(device)
+            else:
                 p = torch.zeros((a.shape), dtype=dtype).to(device)
                 diag_sig = torch.diagonal(sig)
                 sig_i = p + diag_sig.reshape(1, -1)
                 sig_j = p + diag_sig.reshape(-1, 1)
                 q = torch.sqrt(sig_i * sig_j)
-                u = sig/q
+                u = sig / q
                 E = (q * kappa_1(u)) * csigma
                 E_der = (kappa_0(u)) * csigma
-                kernel_der = (a @ a.t()) * E_der
-                kernel_sub[i] += sig * kernel_der
+            E = E.float()
+            E_der = E_der.float()
 
-                E = E.float()
-                sig = a @ E @ a.t()
-                if args.gcn_skip:
-                    if args.skip_form == "gcn":
-                        sig = sig + sig_1
-                    else:
-                        sig = (1-alpha)**2 * sig + alpha**2 * sig_1
-                for j in range(i):
-                    kernel_sub[j] *= kernel_der
+            kernel_sub[i] = a @ (sig * E_der) @ a.t()
 
-            kernel += torch.sum(kernel_sub, dim=0)
+            sig = a @ E @ a.t()
+            if args.gcn_skip:
+                if args.skip_form == "gcn":
+                    sig = sig + sig_1
+                else:
+                    sig = (1 - alpha) ** 2 * sig + alpha ** 2 * sig_1
 
+            for j in range(i):
+                kernel_sub[j] = a @ (kernel_sub[j].float() * E_der) @ a.t()
+
+        kernel += torch.sum(kernel_sub, dim=0)
         kernel += sig
+
+        if args.save_kernel:
+            file = filter + str(d) + '.npy'
+            np.save(file_path + file, kernel)
+            print('!!!Kernel of depth ', d, ' saved to file ', file)
 
         # compute f(x)
         id_t = idx_test[0]
@@ -289,15 +298,8 @@ else:
         labels_train = labels[:id_train].type(torch.double)
         kernel_test = kernel[id_t:, :id_train]
 
-        krr = KernelRidge(alpha=0.0)
-        krr.fit(kernel_train,labels_train)
-        output = torch.tensor(krr.predict(kernel_test))
-
-        file = filter + str(d) + '.npy'
-        if args.save_kernel:
-            np.save(file, kernel)
-            print('!!!Kernel of depth ', d , ' saved to file ', file)
-
-        # compute accuracy of the prediction
+        alpha = 1e-6*kernel_train.max()
+        output = kernel_ridge_reg(kernel_train, kernel_test, labels_train, alpha=alpha)
         acc = accuracy(output, ground_truth)
-        print('Test accuracy using NTK ', acc)
+        print('KRR Test accuracy using NTK ', acc)
+
